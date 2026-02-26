@@ -1,114 +1,158 @@
-import express from "express";
-import cors from "cors";
-import bodyParser from "body-parser";
-import crypto from "crypto";
-import { ethers } from "ethers";
-import dotenv from "dotenv";
-import admin from "firebase-admin";
-import fs from "fs";
+const express = require("express");
+const cors = require("cors");
+const admin = require("firebase-admin");
+const CryptoJS = require("crypto-js");
+require("dotenv").config();
 
-dotenv.config();
-
-const app = express();
-app.use(cors());
-app.use(bodyParser.json());
-
-// 🔥 Firebase Init
-const serviceAccount = JSON.parse(fs.readFileSync("./firebase-key.json", "utf8"));
+// ---------- Firebase Admin Init ----------
+const serviceAccount = require("./firebase-key.json");
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 const db = admin.firestore();
 
-// 🔗 Blockchain Init (Polygon Amoy)
-const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
-const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
-const ABI = ["function fileComplaint(string memory complaintHash) public"];
-const contract = new ethers.Contract(process.env.CONTRACT_ADDRESS, ABI, wallet);
+// ---------- Helpers ----------
+const ENC_KEY = process.env.ENC_KEY || "dev-secret-key-change-this";
 
-// 📥 1) Submit Complaint (User)
+function encrypt(text) {
+  if (!text) return "";
+  return CryptoJS.AES.encrypt(text, ENC_KEY).toString();
+}
+function sha256(text) {
+  return CryptoJS.SHA256(text).toString();
+}
+function randomPin() {
+  return Math.floor(100000 + Math.random() * 900000).toString(); // 6-digit
+}
+
+// ---------- Express ----------
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// Health check
+app.get("/", (req, res) => res.send("✅ Backend running"));
+
+// ---------- Submit Complaint ----------
 app.post("/api/complaint", async (req, res) => {
   try {
-    const data = req.body;
+    const { title, category, location, date, description, anonymous } = req.body;
 
-    // Hash for blockchain proof
-    const hash = crypto
-      .createHash("sha256")
-      .update(JSON.stringify(data))
-      .digest("hex");
+    if (!title || !category || !description) {
+      return res.status(400).json({ success: false, message: "Missing fields" });
+    }
 
-    // Write hash to blockchain
-    const tx = await contract.fileComplaint(hash);
-    const receipt = await tx.wait();
+    const pin = randomPin();
+    const pinHash = sha256(pin);
 
-    // Generate complaint ID
-    const complaintId = "SAKHI-" + Date.now();
-
-    // Store full data in Firebase (encrypt later if needed)
-    await db.collection("complaints").doc(complaintId).set({
-      status: "Submitted",
-      txHash: receipt.hash,
-      timestamp: new Date().toISOString(),
-      hash,
-      data,
+    const docRef = await db.collection("complaints").add({
+      title: encrypt(title),
+      description: encrypt(description),
+      location: encrypt(location || ""),
+      category,
+      date: date || "",
+      anonymous: !!anonymous,
+      status: "Open",
+      pinHash,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
     return res.json({
       success: true,
-      complaintId,
-      txHash: receipt.hash,
-      timestamp: new Date().toISOString(),
+      complaintId: docRef.id,
+      pin, // show once to user
     });
-  } catch (error) {
-    console.error("❌ Submit error:", error);
-    return res.status(500).json({ success: false, error: "Submit failed" });
+  } catch (e) {
+    console.error("Submit error:", e);
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
-// 🔎 2) Track Complaint (User)
-app.get("/api/complaint/:id", async (req, res) => {
+// ---------- Firebase Auth Middleware ----------
+async function verifyFirebaseToken(req, res, next) {
+  const header = req.headers.authorization;
+  if (!header) {
+    return res.status(401).json({ success: false, message: "No auth header" });
+  }
+
+  const token = header.split(" ")[1];
   try {
-    const doc = await db.collection("complaints").doc(req.params.id).get();
+    const decoded = await admin.auth().verifyIdToken(token);
+    req.user = decoded; // uid, email
+    next();
+  } catch (e) {
+    console.error("Auth error:", e);
+    return res.status(401).json({ success: false, message: "Invalid token" });
+  }
+}
 
-    if (!doc.exists) {
-      return res.status(404).json({ success: false, error: "Complaint not found" });
-    }
+// ---------- Admin: List Complaints (Protected) ----------
+app.get("/api/admin/complaints", verifyFirebaseToken, async (req, res) => {
+  try {
+    const snap = await db
+      .collection("complaints")
+      .orderBy("createdAt", "desc")
+      .get();
 
-    const { status, txHash, timestamp } = doc.data();
-    return res.json({ success: true, status, txHash, timestamp });
-  } catch (error) {
-    console.error("❌ Track error:", error);
-    return res.status(500).json({ success: false, error: "Track failed" });
+    const data = snap.docs.map((d) => ({
+      id: d.id,
+      category: d.data().category,
+      status: d.data().status || "Open",
+      createdAt: d.data().createdAt || null,
+    }));
+
+    return res.json({ success: true, data });
+  } catch (e) {
+    console.error("Admin list error:", e);
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
-// 📋 3) Admin – List All Complaints
-app.get("/api/admin/complaints", async (req, res) => {
+// ---------- Admin: Update Complaint Status (Protected) ----------
+app.put("/api/admin/complaints/:id/status", verifyFirebaseToken, async (req, res) => {
   try {
-    const snap = await db.collection("complaints").orderBy("timestamp", "desc").get();
-    const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-    return res.json({ success: true, list });
-  } catch (error) {
-    console.error("❌ Admin list error:", error);
-    return res.status(500).json({ success: false, error: "Fetch failed" });
-  }
-});
-
-// 🔄 4) Admin – Update Complaint Status
-app.put("/api/admin/complaints/:id/status", async (req, res) => {
-  try {
+    const { id } = req.params;
     const { status } = req.body;
 
-    await db.collection("complaints").doc(req.params.id).update({ status });
+    if (!["Open", "In Review", "Resolved"].includes(status)) {
+      return res.status(400).json({ success: false, message: "Invalid status" });
+    }
 
+    await db.collection("complaints").doc(id).update({ status });
     return res.json({ success: true });
-  } catch (error) {
-    console.error("❌ Admin update error:", error);
-    return res.status(500).json({ success: false, error: "Update failed" });
+  } catch (e) {
+    console.error("Update status error:", e);
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
-// 🚀 Start Server
-app.listen(4000, () => {
-  console.log("✅ Backend running at http://localhost:4000");
+// ---------- Track Complaint ----------
+app.post("/api/track", async (req, res) => {
+  try {
+    const { complaintId, pin } = req.body;
+    if (!complaintId || !pin) {
+      return res.status(400).json({ success: false, message: "Missing ID or PIN" });
+    }
+
+    const doc = await db.collection("complaints").doc(complaintId).get();
+    if (!doc.exists) {
+      return res.status(404).json({ success: false, message: "Not found" });
+    }
+
+    const ok = sha256(pin) === doc.data().pinHash;
+    if (!ok) {
+      return res.status(401).json({ success: false, message: "Invalid PIN" });
+    }
+
+    return res.json({ success: true, status: doc.data().status || "Open" });
+  } catch (e) {
+    console.error("Track error:", e);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// ---------- Start Server ----------
+const PORT = process.env.PORT || 4000;
+app.listen(PORT, () => {
+  console.log(`✅ Backend running at http://localhost:${PORT}`);
 });
